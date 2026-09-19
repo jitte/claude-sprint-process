@@ -1,0 +1,7 @@
+{"level":30,"time":1789041045896,"name":"sprint","msg":"1-1  PLAN → REVIEW  forward  gate=pass","ts":"2026-09-10T11:50:45+00:00","sprint":"1-1","from":"PLAN","to":"REVIEW","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041046618,"name":"sprint","msg":"1-1  REVIEW → build-red  forward  gate=pass","ts":"2026-09-10T11:50:46+00:00","sprint":"1-1","from":"REVIEW","to":"build-red","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041046843,"name":"sprint","msg":"1-1  build-red → BUILD  forward  gate=pass","ts":"2026-09-10T11:50:46+00:00","sprint":"1-1","from":"build-red","to":"BUILD","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041047953,"name":"sprint","msg":"1-1  BUILD → TEST  forward  gate=pass","ts":"2026-09-10T11:50:47+00:00","sprint":"1-1","from":"BUILD","to":"TEST","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041048496,"name":"sprint","msg":"1-1  TEST → DOCS  forward  gate=pass","ts":"2026-09-10T11:50:48+00:00","sprint":"1-1","from":"TEST","to":"DOCS","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041049168,"name":"sprint","msg":"1-1  DOCS → SHIP  forward  gate=pass","ts":"2026-09-10T11:50:49+00:00","sprint":"1-1","from":"DOCS","to":"SHIP","direction":"forward","gate":"pass"}
+{"level":30,"time":1789041049376,"name":"sprint","msg":"1-1  SHIP → CLOSED  forward  gate=pass","ts":"2026-09-10T11:50:49+00:00","sprint":"1-1","from":"SHIP","to":"CLOSED","direction":"forward","gate":"pass"}

@@ -1,0 +1,10 @@
+#!/bin/bash
+# eslint-tsc / run-typecheck — コンポーネントのディレクトリ（cwd）で tsc を起動する。
+# tsconfig.json に references があれば tsc -b --force（プロジェクト参照をまとめて検査。--force は
+# 差分ビルドで何も出力せず証跡が空になるのを防ぐ）。無ければ tsc --noEmit。
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+if [ -f tsconfig.json ] && jq -e '.references' tsconfig.json >/dev/null 2>&1; then
+  exec ./node_modules/.bin/tsc -b --force "$@"
+fi
+exec ./node_modules/.bin/tsc --noEmit "$@"

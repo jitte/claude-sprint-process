@@ -1,0 +1,30 @@
+#!/bin/bash
+# eslint-tsc / convert-evidence <verb> — $SPRINT_RAW_DIR/stdout.txt を証跡契約の JSON にする。
+#   lint      : eslint(stylish) のサマリ "(X errors, Y warnings)" を全部合算して errors / warnings に
+#   typecheck : "error TS" の行数を errors に
+#   status    : SPRINT_RUN_EXIT が 0 かつ errors = 0 なら pass
+set -u
+VERB="${1:-$SPRINT_TASK}"
+OUT="$SPRINT_RAW_DIR/stdout.txt"
+RC="${SPRINT_RUN_EXIT:-0}"
+NOW=$(date +%s)
+errors=0; warnings=0
+if [ -f "$OUT" ]; then
+  case "$VERB" in
+    lint)
+      errors=$(grep -oE '\([0-9]+ errors?, [0-9]+ warnings?\)' "$OUT" | grep -oE '[0-9]+ errors?' | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
+      warnings=$(grep -oE '\([0-9]+ errors?, [0-9]+ warnings?\)' "$OUT" | grep -oE '[0-9]+ warnings?' | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}')
+      ;;
+    *)
+      errors=$(grep -c 'error TS' "$OUT" 2>/dev/null || true)
+      ;;
+  esac
+fi
+errors=${errors:-0}; warnings=${warnings:-0}
+status=pass
+{ [ "$RC" -eq 0 ] && [ "$errors" -eq 0 ]; } || status=fail
+jq -nc --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --arg st "$status" \
+  --argjson e "$errors" --argjson w "$warnings" --argjson now "$NOW" \
+  '{schemaVersion:1, component:$c, task:$t, adapter:"eslint-tsc", status:$st,
+    counts:{passed:0,failed:0,skipped:0}, errors:$e, warnings:$w, tests:[],
+    started_at:$now, finished_at:$now}'

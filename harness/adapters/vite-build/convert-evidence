@@ -1,0 +1,12 @@
+#!/bin/bash
+# vite-build / convert-evidence build — $SPRINT_RAW_DIR/stdout.txt の "built in" の有無を status にする。
+set -u
+OUT="$SPRINT_RAW_DIR/stdout.txt"
+RC="${SPRINT_RUN_EXIT:-0}"
+NOW=$(date +%s)
+status=fail; errors=1
+if [ "$RC" -eq 0 ] && [ -f "$OUT" ] && grep -q 'built in' "$OUT"; then status=pass; errors=0; fi
+jq -nc --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --arg st "$status" --argjson e "$errors" --argjson now "$NOW" \
+  '{schemaVersion:1, component:$c, task:$t, adapter:"vite-build", status:$st,
+    counts:{passed:0,failed:0,skipped:0}, errors:$e, warnings:0, tests:[],
+    started_at:$now, finished_at:$now}'

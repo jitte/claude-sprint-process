@@ -1,0 +1,12 @@
+{
+  "active": "1-1",
+  "sprints": {
+    "1-1": {
+      "stage": "CLOSED",
+      "status": "open",
+      "sprint_dir": "docs/07_plans/01_hello/01_hello",
+      "kind": "code",
+      "updated_at": "2026-09-10T11:50:49+00:00"
+    }
+  }
+}

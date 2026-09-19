@@ -1,0 +1,7 @@
+#!/bin/bash
+# playwright / run-test — コンポーネントのディレクトリ（cwd）で playwright test を起動する。
+# JSON は PLAYWRIGHT_JSON_OUTPUT_NAME で $SPRINT_RAW_DIR/result.json に書く。
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+export PLAYWRIGHT_JSON_OUTPUT_NAME="$SPRINT_RAW_DIR/result.json"
+exec ./node_modules/.bin/playwright test --reporter=line,json "$@"

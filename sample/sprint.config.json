@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "project": { "name": "hello", "timezone": "UTC" },
+  "docs": {
+    "templates": "docs/06_process/templates",
+    "livingDirs": [
+      "docs/01_overview",
+      "docs/02_requirements",
+      "docs/03_design",
+      "docs/04_standards",
+      "docs/05_specifications",
+      "docs/06_process",
+      "docs/08_decisions"
+    ],
+    "sprintRoot": "docs/07_plans",
+    "specDir": "docs/05_specifications",
+    "docAliases": []
+  },
+  "tasks": ["lint", "typecheck", "build", "test", "e2e"],
+  "components": {
+    "app": {
+      "dir": "app",
+      "role": "backend",
+      "src": ["app/src/**/*.ts"],
+      "tests": ["app/src/**/*.test.ts"],
+      "adapters": { "test": "node-vitest" }
+    }
+  },
+  "evidence": { "dir": ".sprint/test-result" },
+  "sets": {},
+  "gateToolsDirs": ["harness/gate-tools"],
+  "gateToolClasses": {},
+  "gates": {
+    "code": {
+      "REVIEW": ["spec-files-exist", "spec-lint"],
+      "build-red": ["spec-seal", "spec-lint"],
+      "BUILD": ["tdd-exists"],
+      "TEST": ["results", "size-audit"],
+      "DOCS": ["results", "tdd-audit"],
+      "SHIP": ["results", "tdd-audit", "spec-seal"],
+      "CLOSED": ["ship-closed"]
+    },
+    "docs": {
+      "REVIEW": ["spec-files-exist", "spec-lint"],
+      "build-red": ["spec-seal"],
+      "BUILD": ["spec-files-exist"],
+      "TEST": ["doc-exists"],
+      "DOCS": ["doc-exists", "doc-verified"],
+      "SHIP": ["doc-exists", "doc-verified", "spec-seal"],
+      "CLOSED": ["ship-closed"]
+    }
+  }
+}

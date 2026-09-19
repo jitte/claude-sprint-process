@@ -1,0 +1,41 @@
+#!/bin/bash
+# node-vitest / convert-evidence <verb> — vitest の JSON（jest 互換 testResults）を証跡契約の JSON にする。
+#   tests[].file   = SPRINT_COMPONENT_DIR からの相対
+#   tests[].name   = fullName
+#   tests[].status = passed / failed / skipped（pending と skipped）/ todo
+#   counts         = passed / failed / skipped（todo は数えない）
+#   status         = SPRINT_RUN_EXIT が 0 かつ failed = 0 なら pass
+#
+# 出力先の補正: vitest 4 は CLI で reporter を指定しても、設定ファイルの同名 reporter のオプション
+# （outputFile）を保つ。設定ファイルに json reporter の outputFile が残っている間は、JSON が
+# そちらに書かれる。その場合は本文の「JSON report written to <path>」の行から場所を取る。
+# 設定ファイルから reporter 設定を消せば（切り替え時）、$SPRINT_RAW_DIR/result.json に書かれる。
+set -u
+RAW="$SPRINT_RAW_DIR/result.json"
+RC="${SPRINT_RUN_EXIT:-0}"
+NOW=$(date +%s)
+if [ ! -f "$RAW" ] && [ -f "$SPRINT_RAW_DIR/stdout.txt" ]; then
+  written=$(grep -oE 'JSON report written to .+$' "$SPRINT_RAW_DIR/stdout.txt" | tail -1 | sed 's/^JSON report written to //')
+  [ -n "$written" ] && [ -f "$written" ] && RAW="$written"
+fi
+if [ ! -f "$RAW" ]; then
+  jq -nc --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --argjson now "$NOW" \
+    '{schemaVersion:1, component:$c, task:$t, adapter:"node-vitest", status:"fail",
+      counts:{passed:0,failed:0,skipped:0}, errors:1, warnings:0, tests:[], started_at:$now, finished_at:$now}'
+  exit 0
+fi
+jq -c --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --arg dir "$SPRINT_COMPONENT_DIR/" \
+   --argjson rc "$RC" --argjson now "$NOW" '
+  def rel: if startswith($dir) then .[($dir | length):] else . end;
+  def st: if . == "pending" or . == "skipped" then "skipped" else . end;
+  [ .testResults[]? | .name as $f | .assertionResults[]?
+    | { file: ($f | rel), name: .fullName, status: (.status | st) } ] as $tests
+  | ($tests | map(select(.status == "passed")) | length) as $p
+  | ($tests | map(select(.status == "failed")) | length) as $f
+  | ($tests | map(select(.status == "skipped")) | length) as $s
+  | { schemaVersion: 1, component: $c, task: $t, adapter: "node-vitest",
+      status: (if $rc == 0 and $f == 0 then "pass" else "fail" end),
+      counts: { passed: $p, failed: $f, skipped: $s },
+      errors: 0, warnings: 0, tests: $tests,
+      started_at: ((.startTime // ($now * 1000)) / 1000 | floor),
+      finished_at: $now }' "$RAW"

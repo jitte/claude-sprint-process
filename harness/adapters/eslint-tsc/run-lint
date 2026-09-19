@@ -1,0 +1,6 @@
+#!/bin/bash
+# eslint-tsc / run-lint — コンポーネントのディレクトリ（cwd）で eslint を起動する。
+# --max-warnings 0: eslint は warning があっても exit 0 を返す。証跡の warnings と終了コードを揃える。
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+exec ./node_modules/.bin/eslint . --max-warnings 0 "$@"

@@ -1,0 +1,487 @@
+#!/bin/bash
+# harness/bin/sprint — スプリント状態管理 (.sprint/flags.json への唯一の書き込み口) とタスクの実行
+#
+# flags.json の直接編集は edit-scope-gate.sh が deny する。
+# stage 遷移・新規作成・active 切替はすべて本スクリプト経由で行う。
+# /sprint skill もこのスクリプトを呼ぶ。
+#
+# 主目的: ステージ遷移の skip をブロックする。
+#   前進は「次の許可遷移」のみ。後退（前ステージへの巻き戻し）は常に許可。
+#   PLAN への巻き戻し = 仕様不備対応パス。
+#   封印(spec-seal)は REVIEW 後・build-red 前に行う（REVIEW は未封印の草案を
+#   独立監査し、指摘を反映してから封印で凍結する）。build-red ゲートが封印を強制する。
+#
+# サブコマンド（状態）:
+#   stage <STAGE>           active スプリントのステージを遷移（遷移規則を検証）
+#   set-status <STATUS>     active スプリントの status を更新 (open|doing|closed)
+#   new <id> <dir> [kind]   スプリント新規作成（テンプレ展開・active 切替）
+#   switch <id>             active スプリントを切替
+#   get [<field>]           active スプリントの値を出力（field 省略で stage）
+#   status [--json]         active スプリントの状態を集約表示
+#                           （stage / 封印 / テスト失敗 / 実行証跡の鮮度 / 直近遷移）
+#   list                    全スプリントの一覧
+#   log                     ステージ遷移ログの集計（巻き戻し・ゲート失敗の観測）
+#   set-kind / set-dir / rename
+#
+# サブコマンド（実行。タスク契約）:
+#   run <task>|all [<component>] [-- <追加引数>...]
+#                           設定の tasks の順にアダプタを起動し、証跡契約の JSON を書く
+#
+# サブコマンド（検査。プロセス系の入口をここに集約する）:
+#   gate <STAGE>            ステージゲートを手動実行（harness/tools/gate-check.sh）
+#   seal                    SPEC.md / TEST.md を封印（harness/tools/spec-seal.sh seal）
+#   seal-verify             封印ハッシュの照合（harness/tools/spec-seal.sh verify）
+#   spec-lint [check ...]   仕様の機械検査（harness/gate-tools/spec-lint.sh）
+#   spec-graph [args ...]   条項参照グラフ（harness/tools/spec-graph.sh。引数なしは verify）
+#   spec-coverage [args ...] 条項参照カバレッジ cov / rcov / tcov（harness/tools/spec-coverage.sh。指標。fail しない）
+#   api-routes              公開ルート集合の双方向比較（harness/tools/api-routes.sh verify）
+#   size-audit              サイズ超過ファイルの列挙（harness/gate-tools/size-audit.sh）
+#   spec-check [dir]        SPEC.md / TEST.md の構造検査（harness/tools/spec-check.sh）
+
+set -euo pipefail
+export PATH="${PATH:+$PATH:}/usr/local/bin:/usr/bin:/bin"   # 呼び出し元の PATH を優先し、hook の最小環境でも基本コマンドを保証する
+
+HARNESS="$(dirname "$(readlink -f "$0")")/.."
+. "$HARNESS/lib/env.sh"
+. "$HARNESS/lib/evidence.sh"
+sprint_config_require
+ROOT=$(sprint_root)
+FLAGS="$ROOT/.sprint/flags.json"
+
+die() { echo "sprint: $*" >&2; exit 1; }
+now() { sprint_date +%Y-%m-%dT%H:%M:%S%:z; }
+
+# ── 遷移ログ ──
+# .sprint/logs/stage-transitions.jsonl に1行追記する。
+# プロセス自体の観測データ（どのステージで何回巻き戻したか・どのゲートが何回落ちたか）を
+# 蓄積し、改善対象を事後に数値で特定できるようにする。表示は `bash harness/bin/sprint log`。
+# 不変条件: 記録の失敗で sprint.sh を止めない（常に成功で返る）。
+# 出力は pino NDJSON（`tail -F * | pino-pretty` で読むため）。
+# level は gate=fail のときだけ 40（warn）にする。目で拾えるようにするため。
+log_transition() { # <sprint_id> <from> <to> <direction> <gate>
+  local dir="$ROOT/.sprint/logs"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local ms; ms=$(date +%s%3N 2>/dev/null)
+  case "$ms" in ''|*[!0-9]*) ms=$(( $(date +%s 2>/dev/null) * 1000 )) ;; esac
+  jq -nc --arg ts "$(now)" --argjson ms "$ms" --arg sp "$1" --arg f "$2" --arg t "$3" \
+         --arg d "$4" --arg g "$5" \
+    '{level: (if $g == "fail" then 40 else 30 end),
+      time: $ms,
+      name: "sprint",
+      msg: "\($sp)  \($f) → \($t)  \($d)  gate=\($g)",
+      ts:$ts, sprint:$sp, from:$f, to:$t, direction:$d, gate:$g}' \
+    >> "$dir/stage-transitions.jsonl" 2>/dev/null || true
+  return 0
+}
+
+# ── ステージ順位（前進/後退の判定に使う）──
+# build-* は BUILD バンド内のサブフェーズ。
+rank() {
+  case "$1" in
+    PLAN)         echo 10 ;;
+    REVIEW)       echo 20 ;;
+    build-red)    echo 30 ;;
+    BUILD)        echo 31 ;;
+    TEST)         echo 40 ;;
+    DOCS)         echo 50 ;;
+    SHIP)         echo 60 ;;
+    CLOSED)       echo 70 ;;
+    *)            echo -1 ;;
+  esac
+}
+
+# 各ステージから「前進で許可される次ステージ」集合
+allowed_next() {
+  case "$1" in
+    PLAN)      echo "REVIEW" ;;
+    REVIEW)    echo "build-red" ;;
+    build-red) echo "BUILD" ;;
+    BUILD)     echo "TEST" ;;
+    TEST)      echo "DOCS" ;;
+    DOCS)      echo "SHIP" ;;
+    SHIP)      echo "CLOSED" ;;
+    CLOSED)    echo "" ;;
+    *)         echo "" ;;
+  esac
+}
+
+require_flags() { [ -f "$FLAGS" ] || die "flags.json がありません: $FLAGS （new で作成してください）"; }
+
+active_id() { jq -r '.active // ""' "$FLAGS"; }
+
+write_flags() { # stdin = 新 JSON
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp"
+  mv "$tmp" "$FLAGS"
+}
+
+cmd_stage() {
+  require_flags
+  local to="$1"
+  [ -n "$to" ] || die "遷移先ステージを指定してください: stage <STAGE>"
+  [ "$(rank "$to")" -ge 0 ] || die "不明なステージ: $to"
+
+  local id cur
+  id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+  cur=$(jq -r --arg id "$id" '.sprints[$id].stage // ""' "$FLAGS")
+  [ -n "$cur" ] || die "現在のステージが取得できません。"
+
+  local gate_result="none"
+  if [ "$cur" = "$to" ]; then
+    # 同一ステージへの再設定は許可（status を open に戻す）
+    log_transition "$id" "$cur" "$to" same none
+  elif grep -qx "$to" <<<"$(allowed_next "$cur" | tr ' ' '\n')"; then
+    # ステージ前進時のゲートチェック
+    if [ -f "$HARNESS/tools/gate-check.sh" ]; then
+      # 設定の gates に遷移先ステージの定義があればチェック実行
+      local has_checks kind
+      kind="code"
+      [ -f "$FLAGS" ] && kind=$(jq -r --arg id "$id" '.sprints[$id].kind // "code"' "$FLAGS" 2>/dev/null || echo "code")
+      has_checks=$(jq -r --arg k "$kind" --arg s "$to" 'if .gates[$k][$s] and (.gates[$k][$s] | length > 0) then "yes" else "no" end' "$(sprint_config_path)" 2>/dev/null || echo "no")
+      if [ "$has_checks" = "yes" ]; then
+        echo "sprint: $to ゲートチェック実行中..." >&2
+        if bash "$HARNESS/tools/gate-check.sh" "$to"; then
+          gate_result="pass"
+        else
+          log_transition "$id" "$cur" "$to" forward fail
+          die "ゲートチェック失敗。上記の問題を修正してから再度 stage $to を実行してください。"
+        fi
+      fi
+    fi
+    log_transition "$id" "$cur" "$to" forward "$gate_result"
+  elif [ "$(rank "$to")" -lt "$(rank "$cur")" ]; then
+    echo "sprint: ${cur} → ${to} （巻き戻し）" >&2
+    if [ "$to" = "PLAN" ]; then
+      echo "sprint: PLAN に戻りました。SPEC.md/TEST.md を修正してください（封印は REVIEW 後・build-red 前に 'bash harness/bin/sprint seal'）。" >&2
+    fi
+    log_transition "$id" "$cur" "$to" rollback none
+  else
+    log_transition "$id" "$cur" "$to" denied none
+    die "ステージ skip は許可されていません: ${cur} → ${to}。許可される前進: [$(allowed_next "$cur")]（または前ステージへの巻き戻し）"
+  fi
+
+  # stage 単位の token 消費スナップショット（前 stage 分を確定）。
+  # 次 stage へ進めると判定できた今この時点で記録する。失敗しても遷移は止めない。
+  if [ "$cur" != "$to" ] && [ -f "$HARNESS/tools/stage-tokens.sh" ]; then
+    bash "$HARNESS/tools/stage-tokens.sh" "$id" "$cur" "$to" >/dev/null 2>&1 || true
+  fi
+
+  jq --arg id "$id" --arg s "$to" --arg ts "$(now)" \
+    '.sprints[$id].stage=$s | .sprints[$id].status="open" | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} stage=${to} status=open"
+}
+
+cmd_set_status() {
+  require_flags
+  local st="$1"
+  case "$st" in open|doing|closed) ;; *) die "status は open|doing|closed のいずれか: $st" ;; esac
+  local id; id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+  jq --arg id "$id" --arg st "$st" --arg ts "$(now)" \
+    '.sprints[$id].status=$st | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} status=${st}"
+}
+
+cmd_new() {
+  local id="$1" dir="$2" kind="${3:-code}"
+  [ -n "$id" ] && [ -n "$dir" ] || die "使い方: new <sprint_id> <sprint_dir> [code|docs]"
+  case "$kind" in code|docs) ;; *) die "kind は code|docs のいずれか: $kind" ;; esac
+  if [ ! -f "$FLAGS" ]; then
+    mkdir -p "$(dirname "$FLAGS")"
+    echo '{"active":"","sprints":{}}' > "$FLAGS"
+  fi
+  jq -e --arg id "$id" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 && die "スプリントが既に存在します: $id"
+
+  local templates f
+  templates=$(sprint_abs_path "$(sprint_config '.docs.templates')")
+  for f in README.md SPEC.md TEST.md; do
+    [ -f "$templates/$f" ] || { echo "sprint: templates が無い: $templates" >&2; exit 4; }
+  done
+  mkdir -p "$ROOT/$dir"
+  for f in README.md SPEC.md TEST.md; do
+    [ -f "$ROOT/$dir/$f" ] || cp "$templates/$f" "$ROOT/$dir/$f"
+  done
+
+  jq --arg id "$id" --arg dir "$dir" --arg kind "$kind" --arg ts "$(now)" \
+    '.sprints[$id]={stage:"PLAN",status:"open",sprint_dir:$dir,kind:$kind,updated_at:$ts} | .active=$id' \
+    "$FLAGS" | write_flags
+  echo "sprint: created ${id} (stage=PLAN, kind=${kind}) dir=${dir} active=${id}"
+  echo "sprint: SPEC.md/TEST.md を起草してください（封印は REVIEW 後・build-red 前に 'bash harness/bin/sprint seal'）。"
+}
+
+cmd_switch() {
+  require_flags
+  local id="$1"
+  [ -n "$id" ] || die "切替先 sprint_id を指定してください: switch <id>"
+  jq -e --arg id "$id" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 || die "存在しないスプリント: $id"
+  jq --arg id "$id" '.active=$id' "$FLAGS" | write_flags
+  echo "sprint: active=${id}"
+}
+
+cmd_get() {
+  require_flags
+  local field="${1:-stage}"
+  local id; id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+  jq -r --arg id "$id" --arg f "$field" '.sprints[$id][$f] // ""' "$FLAGS"
+}
+
+# ── 状態の集約 ──
+# 散在する state（flags / 封印 manifest / テスト失敗数 / 実行証跡の鮮度 /
+# 直近の遷移）を1コマンドで読めるようにする。
+# 新しい state ファイルは作らない — 既存の情報源を集約して読むだけ。
+# README §3 のタスク表は引き続き唯一の情報源（ここには複製しない）。
+cmd_status() {
+  require_flags
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+
+  local id; id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+
+  local dir kind stage st updated
+  dir=$(jq -r --arg id "$id" '.sprints[$id].sprint_dir // ""' "$FLAGS")
+  kind=$(jq -r --arg id "$id" '.sprints[$id].kind // "code"' "$FLAGS")
+  stage=$(jq -r --arg id "$id" '.sprints[$id].stage // ""' "$FLAGS")
+  st=$(jq -r --arg id "$id" '.sprints[$id].status // ""' "$FLAGS")
+  updated=$(jq -r --arg id "$id" '.sprints[$id].updated_at // ""' "$FLAGS")
+
+  # 封印状態（manifest にエントリがあるか）
+  local sealed_spec="false" sealed_test="false"
+  local manifest="$ROOT/.sprint/spec-hashes.json"
+  if [ -f "$manifest" ] && [ -n "$dir" ]; then
+    if jq -e --arg k "$dir/SPEC.md" 'has($k)' "$manifest" >/dev/null 2>&1; then sealed_spec="true"; fi
+    if jq -e --arg k "$dir/TEST.md" 'has($k)' "$manifest" >/dev/null 2>&1; then sealed_test="true"; fi
+  fi
+
+  # テスト失敗数
+  local fails="null"
+  if [ -f "$ROOT/.sprint/test-fails.json" ]; then
+    fails=$(jq -c '.' "$ROOT/.sprint/test-fails.json" 2>/dev/null || echo "null")
+  fi
+
+  # 実行証跡の鮮度（判定は results ゲートの fresh と同一のものを再利用する）
+  local fresh="false"
+  if [ -f "$HARNESS/gate-tools/results.sh" ]; then
+    if bash "$HARNESS/gate-tools/results.sh" fresh >/dev/null 2>&1; then fresh="true"; fi
+  fi
+
+  # 直近の遷移
+  local trans="[]"
+  local tlog="$ROOT/.sprint/logs/stage-transitions.jsonl"
+  if [ -f "$tlog" ]; then
+    trans=$(tail -5 "$tlog" | jq -s '.' 2>/dev/null || echo "[]")
+  fi
+
+  if [ "$as_json" -eq 1 ]; then
+    jq -n --arg id "$id" --arg stage "$stage" --arg st "$st" --arg kind "$kind" \
+          --arg dir "$dir" --arg updated "$updated" \
+          --argjson sspec "$sealed_spec" --argjson stest "$sealed_test" \
+          --argjson fails "$fails" --argjson fresh "$fresh" \
+          --argjson trans "$trans" \
+      '{active:$id, stage:$stage, status:$st, kind:$kind, sprint_dir:$dir, updated_at:$updated,
+        sealed:{SPEC:$sspec, TEST:$stest},
+        test_fails:$fails, results_fresh:$fresh,
+        recent_transitions:$trans}'
+    return 0
+  fi
+
+  local m_spec="✗" m_test="✗" m_fresh="stale（ソース変更後に未実行）"
+  [ "$sealed_spec" = "true" ] && m_spec="✓"
+  [ "$sealed_test" = "true" ] && m_test="✓"
+  [ "$fresh" = "true" ] && m_fresh="fresh"
+
+  printf 'Sprint:   %s  [%s / %s]  kind=%s\n' "$id" "$stage" "$st" "$kind"
+  printf 'Dir:      %s\n' "$dir"
+  printf '更新:     %s\n\n' "$updated"
+  printf '封印:     SPEC.md %s   TEST.md %s\n' "$m_spec" "$m_test"
+  if [ "$fails" = "null" ]; then
+    printf 'テスト:   （記録なし）\n'
+  else
+    printf 'テスト:   失敗 %s 件  %s\n' \
+      "$(jq -r '.total // 0' <<<"$fails")" \
+      "$(jq -r '[.tasks // {} | to_entries[] | "\(.key) \(.value)"] | join(" / ")' <<<"$fails")"
+  fi
+  printf '証跡:     %s\n' "$m_fresh"
+
+  if [ "$(jq 'length' <<<"$trans")" -gt 0 ]; then
+    printf '\n直近の遷移:\n'
+    jq -r '.[] | "  \(.time)  \(.from) → \(.to)  \(.direction)  gate=\(.gate)"' <<<"$trans"
+  fi
+}
+
+# 全スプリントの一覧（従来の bash harness/bin/sprint status 相当）
+cmd_list() {
+  require_flags
+  jq -r '"active: \(.active)", (.sprints | to_entries[] | "  \(.key)\t\(.value.stage)\t\(.value.status)\t\(.value.sprint_dir)")' "$FLAGS"
+}
+
+# ── プロセス観測 ──
+# ステージ遷移ログの集計と直近履歴。どのステージが手戻りを生み、どのゲートが
+# 落ちているかを数値で特定するためのもの（プロセス改善の対象選定に使う）。
+cmd_log() {
+  local tlog="$ROOT/.sprint/logs/stage-transitions.jsonl"
+  [ -f "$tlog" ] || { echo "(遷移ログなし。stage 遷移すると記録されます)"; return 0; }
+
+  echo "=== 集計 ==="
+  jq -s -r '
+    "遷移        : \(length) 回",
+    "  前進      : \([.[]|select(.direction=="forward")]|length)",
+    "  巻き戻し  : \([.[]|select(.direction=="rollback")]|length)",
+    "  skip 拒否 : \([.[]|select(.direction=="denied")]|length)",
+    "ゲート失敗  : \([.[]|select(.gate=="fail")]|length) 回",
+    "",
+    "ゲート失敗（遷移先ステージ別）:",
+    ( [.[]|select(.gate=="fail")|.to] | group_by(.)
+      | if length==0 then ["  （なし）"] else map("  \(.[0]): \(length) 回") end | .[] ),
+    "",
+    "巻き戻し（元ステージ別）:",
+    ( [.[]|select(.direction=="rollback")|.from] | group_by(.)
+      | if length==0 then ["  （なし）"] else map("  \(.[0]): \(length) 回") end | .[] )
+  ' "$tlog"
+
+  echo
+  echo "=== 直近 20 件 ==="
+  tail -20 "$tlog" | jq -r '"  \(.time)  [\(.sprint)]  \(.from) → \(.to)  \(.direction)  gate=\(.gate)"'
+}
+
+cmd_set_kind() {
+  require_flags
+  local kind="$1"
+  case "$kind" in code|docs) ;; *) die "kind は code|docs のいずれか: $kind" ;; esac
+  local id; id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+  jq --arg id "$id" --arg kind "$kind" --arg ts "$(now)" \
+    '.sprints[$id].kind=$kind | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} kind=${kind}"
+}
+
+cmd_set_dir() {
+  require_flags
+  local dir="$1"
+  [ -n "$dir" ] || die "dir を指定してください"
+  local id; id=$(active_id); [ -n "$id" ] || die "active スプリントが未設定です。"
+  jq --arg id "$id" --arg dir "$dir" --arg ts "$(now)" \
+    '.sprints[$id].sprint_dir=$dir | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} dir=${dir}"
+}
+
+# rename <old_id> <new_id> [dir]: ID を付け替える。stage / status / kind は保つ。dir を渡せば sprint_dir も替える。
+cmd_rename() {
+  require_flags
+  local old="$1" new="$2" dir="${3:-}"
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: sprint.sh rename <old_id> <new_id> [dir]"
+  jq -e --arg id "$old" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 || die "未登録のスプリント: $old"
+  jq -e --arg id "$new" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 && die "既に存在するスプリント: $new"
+  [ -z "$dir" ] || [ -d "$ROOT/$dir" ] || die "dir が存在しません: $dir"
+  jq --arg old "$old" --arg new "$new" --arg dir "$dir" --arg ts "$(now)" '
+    .sprints[$new] = (.sprints[$old] | .updated_at = $ts | if $dir != "" then .sprint_dir = $dir else . end)
+    | del(.sprints[$old])
+    | if .active == $old then .active = $new else . end' "$FLAGS" | write_flags
+  echo "sprint: ${old} → ${new}${dir:+ dir=$dir}"
+}
+
+# ── タスクの実行（タスク契約 / 証跡契約）──
+# run <task>|all [<component>] [-- <追加引数>...]
+#   tasks の順に、<task> をアダプタに持つコンポーネントを設定の並び順で処理する。
+#   コンポーネントごとに pre.<task> → アダプタの run-<verb> → convert-evidence <verb> の順。
+#   終了コード: 0 = 全 run-<verb> が 0 / 2 = 1 つでも非ゼロ（残りも走らせる。all は動詞単位で fail-fast）/
+#              4 = pre の失敗・アダプタが無い（その場で止める）
+#   追加引数のある実行は部分実行で、証跡を <component>.<task>.partial.json に書く。
+cmd_run() {
+  local task="${1:-}"; shift || true
+  [ -n "$task" ] || die "使い方: run <task>|all [<component>] [-- <追加引数>...]"
+  local only="" extra=() partial=""
+  if [ "${1:-}" != "--" ] && [ -n "${1:-}" ]; then only="$1"; shift; fi
+  if [ "${1:-}" = "--" ]; then shift; extra=("$@"); partial=".partial"; fi
+
+  local verbs
+  if [ "$task" = "all" ]; then
+    verbs=$(sprint_tasks)
+  else
+    grep -qx "$task" <<<"$(sprint_tasks)" || die "不明なタスク: ${task}（tasks: $(sprint_tasks | tr '\n' ' ')）"
+    verbs="$task"
+  fi
+  if [ -n "$only" ]; then
+    grep -qx "$only" <<<"$(sprint_components)" || die "不明なコンポーネント: $only"
+  fi
+
+  local adapters_dir evidence_dir
+  adapters_dir="${SPRINT_ADAPTERS_DIR:-$HARNESS/adapters}"
+  evidence_dir=$(evidence_dir)
+  mkdir -p "$evidence_dir"
+
+  local verb c adapter adapter_dir rverb pre comp_dir raw rc crc verb_rc total_rc=0 tmp
+  for verb in $verbs; do
+    verb_rc=0
+    for c in $(sprint_components); do
+      [ -z "$only" ] || [ "$c" = "$only" ] || continue
+      adapter=$(jq -r --arg c "$c" --arg t "$verb" '.components[$c].adapters[$t] // empty' "$(sprint_config_path)")
+      [ -n "$adapter" ] || continue
+      adapter_dir="$adapters_dir/$adapter"
+      [ -d "$adapter_dir" ] || { echo "sprint: アダプタが無い: ${adapter}（$c.${verb}）"; exit 4; }
+      case "$verb" in e2e) rverb=test ;; *) rverb="$verb" ;; esac
+      comp_dir=$(sprint_abs_path "$(jq -r --arg c "$c" '.components[$c].dir // "."' "$(sprint_config_path)")")
+      raw="$evidence_dir/raw/$c.$verb"
+      mkdir -p "$raw"
+
+      export SPRINT_ROOT="$ROOT" SPRINT_COMPONENT="$c" SPRINT_COMPONENT_DIR="$comp_dir" \
+             SPRINT_TASK="$verb" SPRINT_RAW_DIR="$raw"
+
+      pre=$(jq -r --arg c "$c" --arg t "$verb" '.components[$c].pre[$t] // empty' "$(sprint_config_path)")
+      if [ -n "$pre" ]; then
+        set +e; (cd "$ROOT" && bash -c "$pre"); rc=$?; set -e
+        [ "$rc" -eq 0 ] || { echo "sprint: $c.$verb: pre が失敗（exit ${rc}）"; exit 4; }
+      fi
+
+      echo "sprint: run $c.$verb ($adapter)"
+      set +e
+      (cd "$comp_dir" && "$adapter_dir/run-$rverb" "${extra[@]}") 2>&1 | tee "$raw/stdout.txt"
+      rc=${PIPESTATUS[0]}
+      tmp=$(mktemp)
+      SPRINT_RUN_EXIT="$rc" "$adapter_dir/convert-evidence" "$rverb" > "$tmp"; crc=$?
+      set -e
+      if [ "$crc" -eq 0 ]; then
+        mv "$tmp" "$evidence_dir/$c.$verb$partial.json"
+      else
+        rm -f "$tmp"
+        echo "sprint: $c.$verb: convert-evidence が失敗"
+        [ "$rc" -eq 0 ] && rc=1
+      fi
+      [ "$rc" -eq 0 ] || { verb_rc=2; echo "sprint: $c.$verb: 失敗（exit ${rc}）"; }
+    done
+    if [ "$verb_rc" -ne 0 ]; then
+      total_rc=2
+      [ "$task" = "all" ] && break
+    fi
+  done
+  return "$total_rc"
+}
+
+SUB="${1:-}"; shift || true
+case "$SUB" in
+  stage)      cmd_stage "${1:-}" ;;
+  set-status) cmd_set_status "${1:-}" ;;
+  new)        cmd_new "${1:-}" "${2:-}" "${3:-}" ;;
+  switch)     cmd_switch "${1:-}" ;;
+  get)        cmd_get "${1:-}" ;;
+  status)     cmd_status "${1:-}" ;;
+  list)       cmd_list ;;
+  log)        cmd_log ;;
+  set-kind)   cmd_set_kind "${1:-}" ;;
+  set-dir)    cmd_set_dir "${1:-}" ;;
+  rename)     cmd_rename "${1:-}" "${2:-}" "${3:-}" ;;
+  # ── タスクの実行（アダプタ経由。証跡契約の JSON を書く）──
+  run)         cmd_run "$@" ;;
+  # ── 検査（別スクリプトへの委譲。終了コードはそのまま返す）──
+  gate)        exec bash "$HARNESS/tools/gate-check.sh" "$@" ;;
+  seal)        exec bash "$HARNESS/tools/spec-seal.sh" seal ;;
+  seal-verify) exec bash "$HARNESS/tools/spec-seal.sh" verify ;;
+  spec-check)  exec bash "$HARNESS/tools/spec-check.sh" "$@" ;;
+  spec-lint)   exec bash "$HARNESS/gate-tools/spec-lint.sh" "$@" ;;
+  spec-graph)  [ $# -gt 0 ] || set -- verify; exec bash "$HARNESS/tools/spec-graph.sh" "$@" ;;
+  spec-coverage) exec bash "$HARNESS/tools/spec-coverage.sh" "$@" ;;
+  api-routes)  exec bash "$HARNESS/tools/api-routes.sh" verify ;;
+  size-audit)  exec bash "$HARNESS/gate-tools/size-audit.sh" ;;
+  *) die "不明なサブコマンド: '${SUB}'. 状態: stage|set-status|new|switch|get|status|list|log|set-kind|set-dir|rename / 実行: run / 検査: gate|seal|seal-verify|spec-check|spec-lint|spec-graph|spec-coverage|api-routes|size-audit" ;;
+esac

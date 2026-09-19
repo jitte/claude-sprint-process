@@ -1,0 +1,5 @@
+#!/bin/bash
+# vite-build / run-build — コンポーネントのディレクトリ（cwd）で vite build を起動する。
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+exec ./node_modules/.bin/vite build "$@"

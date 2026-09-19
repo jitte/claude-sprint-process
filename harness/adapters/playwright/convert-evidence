@@ -1,0 +1,32 @@
+#!/bin/bash
+# playwright / convert-evidence test — Playwright の JSON を spec 単位に集約して証跡契約の JSON にする。
+#   spec の tests[].status に unexpected があれば failed、flaky があれば flaky、skipped があれば skipped、それ以外は passed
+#   counts = passed / failed / skipped / flaky（retry で通った flaky は pass にしない。status が fail になる）
+set -u
+RAW="$SPRINT_RAW_DIR/result.json"
+RC="${SPRINT_RUN_EXIT:-0}"
+NOW=$(date +%s)
+if [ ! -f "$RAW" ]; then
+  jq -nc --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --argjson now "$NOW" \
+    '{schemaVersion:1, component:$c, task:$t, adapter:"playwright", status:"fail",
+      counts:{passed:0,failed:0,skipped:0,flaky:0}, errors:1, warnings:0, tests:[], started_at:$now, finished_at:$now}'
+  exit 0
+fi
+jq -c --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --argjson rc "$RC" --argjson now "$NOW" '
+  [ .. | objects | select(has("specs")) | .specs[]? |
+    { file: .file, name: .title,
+      status: ([.tests[]?.status]
+        | if any(. == "unexpected") then "failed"
+          elif any(. == "flaky") then "flaky"
+          elif any(. == "skipped") then "skipped"
+          else "passed" end) } ] as $tests
+  | ($tests | map(select(.status == "passed")) | length) as $p
+  | ($tests | map(select(.status == "failed")) | length) as $f
+  | ($tests | map(select(.status == "skipped")) | length) as $s
+  | ($tests | map(select(.status == "flaky")) | length) as $fl
+  | { schemaVersion: 1, component: $c, task: $t, adapter: "playwright",
+      status: (if $rc == 0 and $f == 0 and $fl == 0 then "pass" else "fail" end),
+      counts: { passed: $p, failed: $f, skipped: $s, flaky: $fl },
+      errors: 0, warnings: 0, tests: $tests,
+      started_at: (try (.stats.startTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch $now),
+      finished_at: $now }' "$RAW"
